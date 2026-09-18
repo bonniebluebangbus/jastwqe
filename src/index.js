@@ -19,7 +19,7 @@ const {
   SlashCommandBuilder,
 } = require('discord.js');
 
-const requiredEnvironment = ['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID'];
+const requiredEnvironment = ['BOT_TOKEN', 'CLIENT_ID', 'GUILD_ID'];
 const missingEnvironment = requiredEnvironment.filter((name) => !process.env[name]);
 const deporterUserId = '1522959087153713238';
 const sayUserIds = new Set(['1522959087153713238', '967075477267308544']);
@@ -695,7 +695,7 @@ async function sendLog({ title, description, user }) {
 }
 
 async function registerCommands() {
-  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+  const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
 
   await rest.put(
     Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
@@ -1537,7 +1537,7 @@ process.on('uncaughtException', (error) => {
 async function start() {
   await initializeDatabase();
   await registerCommands();
-  await client.login(process.env.DISCORD_TOKEN);
+  await client.login(process.env.BOT_TOKEN);
 }
 
 start().catch((error) => {
