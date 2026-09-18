@@ -3,6 +3,7 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const { randomUUID } = require('crypto');
+const initSqlJs = require('sql.js');
 
 const {
   ActionRowBuilder,
@@ -135,31 +136,184 @@ const SHOP_PRODUCTS = [
 ];
 
 const dataDirectory = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
-const economyFilePath = path.join(dataDirectory, 'economy.json');
+const databaseFilePath = path.join(dataDirectory, 'bot.sqlite');
+const legacyEconomyFilePath = path.join(dataDirectory, 'economy.json');
 const robCooldowns = new Map();
 const workCooldowns = new Map();
 const crimeCooldowns = new Map();
 const scanCooldowns = new Map();
 
-function loadEconomy() {
+function emptyEconomy() {
+  return { users: {}, approvedAppointments: {}, appointments: {}, purchases: [] };
+}
+
+function loadLegacyEconomy() {
   try {
-    return JSON.parse(fs.readFileSync(economyFilePath, 'utf8'));
+    return JSON.parse(fs.readFileSync(legacyEconomyFilePath, 'utf8'));
   } catch (error) {
-    if (error.code !== 'ENOENT') console.error('Could not load economy data:', error.message);
-    return { users: {}, approvedAppointments: {}, appointments: {} };
+    if (error.code !== 'ENOENT') console.error('Could not load legacy economy data:', error.message);
+    return emptyEconomy();
   }
 }
 
-const economy = loadEconomy();
+let sqlDatabase;
+let economy = emptyEconomy();
 economy.users ||= {};
 economy.approvedAppointments ||= {};
 economy.appointments ||= {};
+economy.purchases ||= [];
+
+function readSqlRows(query) {
+  const result = sqlDatabase.exec(query);
+  if (!result.length) return [];
+  return result[0].values.map((values) => Object.fromEntries(
+    result[0].columns.map((column, index) => [column, values[index]]),
+  ));
+}
+
+function loadEconomyFromDatabase() {
+  const loadedEconomy = emptyEconomy();
+  for (const account of readSqlRows('SELECT user_id, wallet, bank FROM users')) {
+    loadedEconomy.users[account.user_id] = { wallet: account.wallet, bank: account.bank };
+  }
+  for (const appointment of readSqlRows('SELECT * FROM appointments')) {
+    loadedEconomy.appointments[appointment.id] = {
+      id: appointment.id,
+      patientId: appointment.patient_id,
+      clinicName: appointment.clinic_name,
+      clinicCode: appointment.clinic_code,
+      doctorName: appointment.doctor_name,
+      reason: appointment.reason,
+      dateTime: appointment.date_time,
+      channelId: appointment.channel_id,
+      messageId: appointment.message_id,
+      status: appointment.status,
+      createdAt: appointment.created_at,
+      approvedBy: appointment.approved_by,
+      decidedAt: appointment.decided_at,
+      finishedBy: appointment.finished_by,
+      finishedAt: appointment.finished_at,
+    };
+  }
+  for (const payout of readSqlRows('SELECT appointment_id, approved_by, payout, approved_at FROM approved_appointments')) {
+    loadedEconomy.approvedAppointments[payout.appointment_id] = {
+      approvedBy: payout.approved_by,
+      payout: payout.payout,
+      approvedAt: payout.approved_at,
+    };
+  }
+  loadedEconomy.purchases = readSqlRows('SELECT id, user_id, item_name, price, purchased_at FROM purchases')
+    .map((purchase) => ({
+      id: purchase.id,
+      userId: purchase.user_id,
+      itemName: purchase.item_name,
+      price: purchase.price,
+      purchasedAt: purchase.purchased_at,
+    }));
+  return loadedEconomy;
+}
+
+async function initializeDatabase() {
+  fs.mkdirSync(dataDirectory, { recursive: true });
+  const SQL = await initSqlJs({
+    locateFile: (file) => path.join(__dirname, '..', 'node_modules', 'sql.js', 'dist', file),
+  });
+  sqlDatabase = fs.existsSync(databaseFilePath)
+    ? new SQL.Database(fs.readFileSync(databaseFilePath))
+    : new SQL.Database();
+
+  sqlDatabase.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      user_id TEXT PRIMARY KEY,
+      wallet INTEGER NOT NULL DEFAULT 0,
+      bank INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS appointments (
+      id TEXT PRIMARY KEY,
+      patient_id TEXT NOT NULL,
+      clinic_name TEXT NOT NULL,
+      clinic_code TEXT NOT NULL,
+      doctor_name TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      date_time TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('PENDING', 'ACTIVE', 'DECLINED', 'FINISHED')),
+      created_at TEXT NOT NULL,
+      approved_by TEXT,
+      decided_at TEXT,
+      finished_by TEXT,
+      finished_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS approved_appointments (
+      appointment_id TEXT PRIMARY KEY REFERENCES appointments(id),
+      approved_by TEXT NOT NULL,
+      payout INTEGER NOT NULL DEFAULT 0,
+      approved_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS purchases (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      item_name TEXT NOT NULL,
+      price INTEGER NOT NULL,
+      purchased_at TEXT NOT NULL
+    );
+  `);
+
+  const hasExistingData = readSqlRows('SELECT 1 AS present FROM users LIMIT 1').length
+    || readSqlRows('SELECT 1 AS present FROM appointments LIMIT 1').length
+    || readSqlRows('SELECT 1 AS present FROM approved_appointments LIMIT 1').length
+    || readSqlRows('SELECT 1 AS present FROM purchases LIMIT 1').length;
+  economy = hasExistingData ? loadEconomyFromDatabase() : loadLegacyEconomy();
+  saveEconomy();
+}
 
 function saveEconomy() {
-  fs.mkdirSync(path.dirname(economyFilePath), { recursive: true });
-  const temporaryPath = `${economyFilePath}.tmp`;
-  fs.writeFileSync(temporaryPath, `${JSON.stringify(economy, null, 2)}\n`, 'utf8');
-  fs.renameSync(temporaryPath, economyFilePath);
+  if (!sqlDatabase) throw new Error('Database has not been initialized');
+
+  sqlDatabase.run('BEGIN TRANSACTION');
+  try {
+    sqlDatabase.run('DELETE FROM users; DELETE FROM appointments; DELETE FROM approved_appointments; DELETE FROM purchases;');
+
+    const insertUser = sqlDatabase.prepare('INSERT INTO users (user_id, wallet, bank) VALUES (?, ?, ?)');
+    for (const [userId, account] of Object.entries(economy.users)) insertUser.run([userId, account.wallet, account.bank]);
+    insertUser.free();
+
+    const insertAppointment = sqlDatabase.prepare(`
+      INSERT INTO appointments
+        (id, patient_id, clinic_name, clinic_code, doctor_name, reason, date_time, channel_id, message_id, status, created_at, approved_by, decided_at, finished_by, finished_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const appointment of Object.values(economy.appointments)) {
+      insertAppointment.run([
+        appointment.id, appointment.patientId, appointment.clinicName, appointment.clinicCode,
+        appointment.doctorName, appointment.reason, appointment.dateTime, appointment.channelId,
+        appointment.messageId, appointment.status, appointment.createdAt, appointment.approvedBy || null,
+        appointment.decidedAt || null, appointment.finishedBy || null, appointment.finishedAt || null,
+      ]);
+    }
+    insertAppointment.free();
+
+    const insertPayout = sqlDatabase.prepare('INSERT INTO approved_appointments (appointment_id, approved_by, payout, approved_at) VALUES (?, ?, ?, ?)');
+    for (const [appointmentId, payout] of Object.entries(economy.approvedAppointments)) {
+      insertPayout.run([appointmentId, payout.approvedBy, payout.payout, payout.approvedAt]);
+    }
+    insertPayout.free();
+
+    const insertPurchase = sqlDatabase.prepare('INSERT INTO purchases (id, user_id, item_name, price, purchased_at) VALUES (?, ?, ?, ?, ?)');
+    for (const purchase of economy.purchases) {
+      insertPurchase.run([purchase.id, purchase.userId, purchase.itemName, purchase.price, purchase.purchasedAt]);
+    }
+    insertPurchase.free();
+    sqlDatabase.run('COMMIT');
+  } catch (error) {
+    sqlDatabase.run('ROLLBACK');
+    throw error;
+  }
+
+  const temporaryPath = `${databaseFilePath}.tmp`;
+  fs.writeFileSync(temporaryPath, Buffer.from(sqlDatabase.export()));
+  fs.renameSync(temporaryPath, databaseFilePath);
 }
 
 function getAccount(userId) {
@@ -1180,6 +1334,13 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       buyerAccount.wallet -= product.price;
+      economy.purchases.push({
+        id: randomUUID(),
+        userId: interaction.user.id,
+        itemName: product.name,
+        price: product.price,
+        purchasedAt: new Date().toISOString(),
+      });
       saveEconomy();
       const purchaseChannel = await client.channels.fetch(purchaseChannelId);
       if (!purchaseChannel?.isTextBased()) {
@@ -1374,6 +1535,7 @@ process.on('uncaughtException', (error) => {
 });
 
 async function start() {
+  await initializeDatabase();
   await registerCommands();
   await client.login(process.env.DISCORD_TOKEN);
 }
