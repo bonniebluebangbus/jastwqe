@@ -743,6 +743,18 @@ async function findRecentAuditExecutor(guild, type, targetId) {
   }
 }
 
+async function findRecentAuditReason(guild, type, targetId) {
+  try {
+    const logs = await guild.fetchAuditLogs({ type, limit: 10 });
+    const entry = logs.entries.find((candidate) =>
+      candidate.target?.id === targetId && Date.now() - candidate.createdTimestamp < 15_000);
+    return entry?.reason || 'No reason provided';
+  } catch (error) {
+    console.warn(`Could not read audit-log reason for ${type}:`, error.message);
+    return 'No reason provided';
+  }
+}
+
 function auditActorText(actor) {
   return actor ? `${actor.tag} (<@${actor.id}>)` : 'Unknown or unavailable';
 }
@@ -817,9 +829,10 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
   const executor = await findRecentAuditExecutor(newMember.guild, AuditLogEvent.MemberUpdate, newMember.id);
   if (newTimeout > Date.now()) {
     const duration = Math.max(0, newTimeout - Date.now());
+    const reason = await findRecentAuditReason(newMember.guild, AuditLogEvent.MemberUpdate, newMember.id);
     await sendLog({
       title: 'Member Timed Out',
-      description: `**${newMember.user.tag}** (<@${newMember.id}>) was timed out for approximately **${Math.ceil(duration / 60000)} minute(s)** by **${auditActorText(executor)}**.\n**Until:** ${discordTimestamp(new Date(newTimeout))}`,
+      description: `**${newMember.user.tag}** (<@${newMember.id}>) was arrested by **${auditActorText(executor)}** for **${reason}**. **${newMember.user.tag}** is in jail for **${Math.ceil(duration / 60000)} minute(s)**.`,
       user: newMember.user,
     });
   } else {
