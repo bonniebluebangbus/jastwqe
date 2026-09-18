@@ -7,6 +7,7 @@ const initSqlJs = require('sql.js');
 
 const {
   ActionRowBuilder,
+  AuditLogEvent,
   ButtonBuilder,
   ButtonStyle,
   Client,
@@ -646,7 +647,9 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildModeration,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.MessageContent,
   ],
@@ -694,6 +697,30 @@ async function sendLog({ title, description, user }) {
   }
 }
 
+async function findRecentAuditExecutor(guild, type, targetId) {
+  try {
+    const logs = await guild.fetchAuditLogs({ type, limit: 10 });
+    const entry = logs.entries.find((candidate) =>
+      candidate.target?.id === targetId && Date.now() - candidate.createdTimestamp < 15_000);
+    return entry?.executor || null;
+  } catch (error) {
+    console.warn(`Could not read audit logs for ${type}:`, error.message);
+    return null;
+  }
+}
+
+function auditActorText(actor) {
+  return actor ? `${actor.tag} (<@${actor.id}>)` : 'Unknown or unavailable';
+}
+
+async function logDeniedCommand(interaction, reason) {
+  await sendLog({
+    title: 'Unauthorized Command Attempt',
+    description: `**${interaction.user.tag}** (<@${interaction.user.id}>) tried to run **/${interaction.commandName}** but was denied.\n**Reason:** ${reason}\n**Channel:** <#${interaction.channelId}>`,
+    user: interaction.user,
+  });
+}
+
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
 
@@ -711,18 +738,109 @@ client.once('ready', (readyClient) => {
 
 client.on('guildMemberAdd', async (member) => {
   await sendLog({
-    title: 'Join Notification',
-    description: `**${member.user.username}** has joined bonnie blue bang bus.`,
+    title: 'Member Joined',
+    description: `**${member.user.tag}** (<@${member.id}>) joined the server.\n**Account created:** ${discordTimestamp(member.user.createdAt)}`,
     user: member.user,
   });
 });
 
 client.on('guildMemberRemove', async (member) => {
+  const executor = await findRecentAuditExecutor(member.guild, AuditLogEvent.MemberKick, member.id);
+  const banExecutor = await findRecentAuditExecutor(member.guild, AuditLogEvent.MemberBanAdd, member.id);
+  if (banExecutor) return;
   await sendLog({
-    title: 'Leave Notification',
-    description: `**${member.user.username}** has left bonnie blue bang bus.`,
+    title: executor ? 'Member Kicked' : 'Member Left',
+    description: executor
+      ? `**${member.user.tag}** (<@${member.id}>) was kicked from the server by **${auditActorText(executor)}**.`
+      : `**${member.user.tag}** (<@${member.id}>) left the server voluntarily or was removed before audit logs were available.`,
     user: member.user,
   });
+});
+
+client.on('guildBanAdd', async (ban) => {
+  const executor = await findRecentAuditExecutor(ban.guild, AuditLogEvent.MemberBanAdd, ban.user.id);
+  await sendLog({
+    title: 'Member Banned',
+    description: `**${ban.user.tag}** (<@${ban.user.id}>) was banned by **${auditActorText(executor)}**.\n**Reason:** ${ban.reason || 'No reason provided.'}`,
+    user: ban.user,
+  });
+});
+
+client.on('guildBanRemove', async (ban) => {
+  const executor = await findRecentAuditExecutor(ban.guild, AuditLogEvent.MemberBanRemove, ban.user.id);
+  await sendLog({
+    title: 'Member Unbanned',
+    description: `**${ban.user.tag}** (<@${ban.user.id}>) was unbanned by **${auditActorText(executor)}**.`,
+    user: ban.user,
+  });
+});
+
+client.on('guildMemberUpdate', async (oldMember, newMember) => {
+  const oldTimeout = oldMember.communicationDisabledUntilTimestamp || 0;
+  const newTimeout = newMember.communicationDisabledUntilTimestamp || 0;
+  if (oldTimeout === newTimeout) return;
+
+  const executor = await findRecentAuditExecutor(newMember.guild, AuditLogEvent.MemberUpdate, newMember.id);
+  if (newTimeout > Date.now()) {
+    const duration = Math.max(0, newTimeout - Date.now());
+    await sendLog({
+      title: 'Member Timed Out',
+      description: `**${newMember.user.tag}** (<@${newMember.id}>) was timed out for approximately **${Math.ceil(duration / 60000)} minute(s)** by **${auditActorText(executor)}**.\n**Until:** ${discordTimestamp(new Date(newTimeout))}`,
+      user: newMember.user,
+    });
+  } else {
+    await sendLog({
+      title: 'Member Timeout Removed',
+      description: `The timeout was removed from **${newMember.user.tag}** (<@${newMember.id}>) by **${auditActorText(executor)}**.`,
+      user: newMember.user,
+    });
+  }
+});
+
+client.on('voiceStateUpdate', async (oldState, newState) => {
+  const user = newState.member?.user || oldState.member?.user;
+  if (!user) return;
+
+  if (!oldState.channelId && newState.channelId) {
+    await sendLog({
+      title: 'Voice Channel Joined',
+      description: `**${user.tag}** (<@${user.id}>) joined **${newState.channel?.name || newState.channelId}**.`,
+      user,
+    });
+  } else if (oldState.channelId && !newState.channelId) {
+    const executor = await findRecentAuditExecutor(newState.guild, AuditLogEvent.MemberDisconnect, user.id);
+    await sendLog({
+      title: executor ? 'Member Disconnected From Voice' : 'Voice Channel Left',
+      description: executor
+        ? `**${user.tag}** (<@${user.id}>) was disconnected from **${oldState.channel?.name || oldState.channelId}** by **${auditActorText(executor)}**.`
+        : `**${user.tag}** (<@${user.id}>) left **${oldState.channel?.name || oldState.channelId}**.`,
+      user,
+    });
+  } else if (oldState.channelId !== newState.channelId) {
+    await sendLog({
+      title: 'Voice Channel Moved',
+      description: `**${user.tag}** (<@${user.id}>) moved from **${oldState.channel?.name || oldState.channelId}** to **${newState.channel?.name || newState.channelId}**.`,
+      user,
+    });
+  }
+
+  if (oldState.serverMute !== newState.serverMute) {
+    const executor = await findRecentAuditExecutor(newState.guild, AuditLogEvent.MemberUpdate, user.id);
+    await sendLog({
+      title: newState.serverMute ? 'Member Server Muted' : 'Member Server Unmuted',
+      description: `**${user.tag}** (<@${user.id}>) was ${newState.serverMute ? 'server muted' : 'server unmuted'} by **${auditActorText(executor)}**.`,
+      user,
+    });
+  }
+
+  if (oldState.serverDeaf !== newState.serverDeaf) {
+    const executor = await findRecentAuditExecutor(newState.guild, AuditLogEvent.MemberUpdate, user.id);
+    await sendLog({
+      title: newState.serverDeaf ? 'Member Server Deafened' : 'Member Server Undeafened',
+      description: `**${user.tag}** (<@${user.id}>) was ${newState.serverDeaf ? 'server deafened' : 'server undeafened'} by **${auditActorText(executor)}**.`,
+      user,
+    });
+  }
 });
 
 client.on('messageUpdate', async (oldMessage, newMessage) => {
@@ -806,6 +924,11 @@ client.on('interactionCreate', async (interaction) => {
       const [, action, userId, clinicCode, encodedDateTime, appointmentId] = interaction.customId.split(':');
       const approverIds = bookingApproversFor(clinicCode);
       if (!approverIds.has(interaction.user.id)) {
+        await sendLog({
+          title: 'Unauthorized Appointment Button Attempt',
+          description: `**${interaction.user.tag}** (<@${interaction.user.id}>) tried to use **${action || 'unknown'}** on appointment button **${appointmentId || 'unknown'}** but does not have permission.\n**Channel:** <#${interaction.channelId}>`,
+          user: interaction.user,
+        });
         const attempts = rememberUnauthorizedBookingAttempt(interaction.guildId, interaction.user.id);
         if (attempts > 3 && interaction.member?.moderatable) {
           await interaction.member.timeout(5 * 60 * 1000, 'Repeated unauthorized appointment button clicks');
@@ -819,14 +942,29 @@ client.on('interactionCreate', async (interaction) => {
 
       const appointment = economy.appointments[appointmentId];
       if (!appointment || !['approve', 'decline'].includes(action) || appointment.patientId !== userId || appointment.clinicCode !== clinicCode) {
+        await sendLog({
+          title: 'Invalid Appointment Button Attempt',
+          description: `**${interaction.user.tag}** (<@${interaction.user.id}>) pressed an invalid or expired appointment button.\n**Appointment:** ${appointmentId || 'unknown'}`,
+          user: interaction.user,
+        });
         await respondToInteraction(interaction, { content: 'This appointment button is no longer valid.', ephemeral: true });
         return;
       }
       if (appointment.status !== 'PENDING') {
+        await sendLog({
+          title: 'Already Processed Appointment Button',
+          description: `**${interaction.user.tag}** (<@${interaction.user.id}>) tried to process appointment **${appointmentId}**, which is already **${appointment.status}**.`,
+          user: interaction.user,
+        });
         await respondToInteraction(interaction, { content: `This appointment has already been ${appointment.status.toLowerCase()}.`, ephemeral: true });
         return;
       }
       if (appointmentLocks.has(appointmentId)) {
+        await sendLog({
+          title: 'Duplicate Appointment Button Attempt',
+          description: `**${interaction.user.tag}** (<@${interaction.user.id}>) clicked appointment **${appointmentId}** while another action was processing.`,
+          user: interaction.user,
+        });
         await respondToInteraction(interaction, { content: 'This appointment is already being processed.', ephemeral: true });
         return;
       }
@@ -881,6 +1019,11 @@ client.on('interactionCreate', async (interaction) => {
     const cooldownKey = `${interaction.user.id}:${interaction.commandName}`;
     const lastInteractionAt = interactionCooldowns.get(cooldownKey) || 0;
     if (Date.now() - lastInteractionAt < 1000) {
+        await sendLog({
+          title: 'Command Rate Limited',
+          description: `**${interaction.user.tag}** (<@${interaction.user.id}>) attempted **/${interaction.commandName}** too quickly.`,
+          user: interaction.user,
+        });
       await respondToInteraction(interaction, { content: 'Please wait a moment before using this command again.', ephemeral: true });
       return;
     }
@@ -891,6 +1034,11 @@ client.on('interactionCreate', async (interaction) => {
     await interaction.deferReply({ ephemeral: interaction.commandName === 'dm' || interaction.commandName === 'say' });
   } catch (error) {
     console.error(`Could not acknowledge /${interaction.commandName}:`, error.message);
+    await sendLog({
+      title: 'Command Acknowledgement Failed',
+      description: `**/${interaction.commandName}** from **${interaction.user.tag}** (<@${interaction.user.id}>) could not be acknowledged.\n**Error:** ${error.message}`,
+      user: interaction.user,
+    });
     return;
   }
 
@@ -903,11 +1051,13 @@ client.on('interactionCreate', async (interaction) => {
   try {
     if (interaction.commandName === 'deport') {
       if (!isSuperAdmin(interaction.user.id) && interaction.user.id !== deporterUserId) {
+        await logDeniedCommand(interaction, 'User is not authorized.');
         await interaction.editReply({ content: 'You are not authorized to use this command.' });
         return;
       }
 
       if (!interaction.memberPermissions?.has(PermissionFlagsBits.BanMembers)) {
+        await logDeniedCommand(interaction, 'Missing Ban Members permission.');
         await interaction.editReply({ content: 'You need Ban Members permission to use this command.' });
         return;
       }
@@ -946,6 +1096,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.commandName === 'arrest') {
       if (!interaction.memberPermissions?.has(PermissionFlagsBits.ModerateMembers)) {
+        await logDeniedCommand(interaction, 'Missing Moderate Members permission.');
         await interaction.editReply({ content: 'You need Moderate Members permission to use this command.' });
         return;
       }
@@ -971,6 +1122,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.commandName === 'dm') {
       if (!isSuperAdmin(interaction.user.id) && interaction.user.id !== dmUserId) {
+        await logDeniedCommand(interaction, 'User is not authorized.');
         await interaction.editReply({ content: 'You are not authorized to use this command.' });
         return;
       }
@@ -1005,6 +1157,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.commandName === 'say') {
       if (!isSuperAdmin(interaction.user.id) && !sayUserIds.has(interaction.user.id)) {
+        await logDeniedCommand(interaction, 'User is not authorized.');
         await interaction.editReply({ content: 'You are not authorized to use this command.' });
         return;
       }
@@ -1017,6 +1170,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.commandName === 'purge') {
       if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages)) {
+        await logDeniedCommand(interaction, 'Missing Manage Messages permission.');
         await interaction.editReply({ content: 'You need Manage Messages permission to use this command.' });
         return;
       }
@@ -1034,6 +1188,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.commandName === 'pay') {
       if (interaction.user.id !== deporterUserId) {
+        await logDeniedCommand(interaction, 'User is not authorized.');
         await interaction.editReply({ content: 'You do not have permission to use this command.' });
         return;
       }
@@ -1076,6 +1231,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.commandName === 'addmoney') {
       if (interaction.user.id !== '1522959087153713238') {
+        await logDeniedCommand(interaction, 'User is not authorized.');
         await interaction.editReply({ content: 'You do not have permission to use this command.' });
         return;
       }
@@ -1290,6 +1446,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.commandName === 'prescribe') {
       if (!isSuperAdmin(interaction.user.id) && !prescribeUserIds.has(interaction.user.id)) {
+        await logDeniedCommand(interaction, 'User is not authorized to prescribe medication.');
         await interaction.editReply({ content: 'You are not authorized to prescribe medication.' });
         return;
       }
@@ -1372,6 +1529,7 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       if (!bookingApproversFor(appointment.clinicCode).has(interaction.user.id)) {
+        await logDeniedCommand(interaction, 'User is not authorized to manage this clinic appointment.');
         await interaction.editReply({ content: 'You are not authorized to manage appointments for this clinic.' });
         return;
       }
@@ -1514,6 +1672,12 @@ client.on('interactionCreate', async (interaction) => {
     }
   } catch (error) {
     console.error(`Error handling /${interaction.commandName}:`, error);
+
+    await sendLog({
+      title: 'Bot Command Failed',
+      description: `**/${interaction.commandName}** from **${interaction.user.tag}** (<@${interaction.user.id}>) failed.\n**Channel:** <#${interaction.channelId}>\n**Error:** ${error.message || 'Unknown error'}`,
+      user: interaction.user,
+    });
 
     if (interaction.commandName === 'dm' && error.code === 50278) {
       await interaction.editReply({
