@@ -43,6 +43,7 @@ const activeBookings = new Map();
 const appointmentLocks = new Set();
 const unauthorizedBookingAttempts = new Map();
 const interactionCooldowns = new Map();
+const dmAllCooldowns = new Map();
 
 // ============================================================
 // ECONOMY SETTINGS
@@ -465,6 +466,16 @@ const commands = [
         .setRequired(true),
     ),
   new SlashCommandBuilder()
+    .setName('dmall')
+    .setDescription('Send a direct message to everyone in the server.')
+    .addStringOption((option) =>
+      option
+        .setName('message')
+        .setDescription('The message to send to the server.')
+        .setRequired(true)
+        .setMaxLength(2000),
+    ),
+  new SlashCommandBuilder()
     .setName('book')
     .setDescription('Book an appointment at one of Britney\'s clinics.')
     .addStringOption((option) =>
@@ -662,6 +673,29 @@ function discordTimestamp(date = new Date()) {
 function dmChannelName(username) {
   const safeUsername = username.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'user';
   return `dm-with-${safeUsername}`.slice(0, 100);
+}
+
+async function createDmRelayChannel(user) {
+  const category = await client.channels.fetch(dmCategoryId);
+  if (!category || category.type !== ChannelType.GuildCategory) {
+    throw new Error('The configured DM category could not be found.');
+  }
+
+  const existingChannel = category.children.cache.find((channel) => channel.name === dmChannelName(user.username));
+  if (existingChannel?.isTextBased()) {
+    activeDmChannels.set(user.id, existingChannel.id);
+    dmChannelRecipients.set(existingChannel.id, user.id);
+    return existingChannel;
+  }
+
+  const dmChannel = await category.guild.channels.create({
+    name: dmChannelName(user.username),
+    type: ChannelType.GuildText,
+    parent: dmCategoryId,
+  });
+  activeDmChannels.set(user.id, dmChannel.id);
+  dmChannelRecipients.set(dmChannel.id, user.id);
+  return dmChannel;
 }
 
 function disabledBookingComponents(components) {
@@ -894,11 +928,14 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  const dmChannelId = activeDmChannels.get(message.author.id);
-  if (!dmChannelId) return;
+  let dmChannelId = activeDmChannels.get(message.author.id);
 
   try {
-    const responseChannel = await client.channels.fetch(dmChannelId);
+    let responseChannel = dmChannelId ? await client.channels.fetch(dmChannelId) : null;
+    if (!responseChannel?.isTextBased()) {
+      responseChannel = await createDmRelayChannel(message.author);
+      dmChannelId = responseChannel.id;
+    }
     if (!responseChannel?.isTextBased()) return;
 
     const embed = new EmbedBuilder()
@@ -912,6 +949,9 @@ client.on('messageCreate', async (message) => {
     }));
 
     await responseChannel.send({ embeds: [embed], files });
+    if (!activeDmChannels.has(message.author.id)) {
+      activeDmChannels.set(message.author.id, responseChannel.id);
+    }
   } catch (error) {
     console.error(`Could not forward DM from ${message.author.tag}:`, error.message);
   }
@@ -1120,6 +1160,49 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === 'dmall') {
+      if (!isSuperAdmin(interaction.user.id) && interaction.user.id !== dmUserId) {
+        await logDeniedCommand(interaction, 'User is not authorized to use /dmall.');
+        await interaction.editReply({ content: 'You are not authorized to use this command.' });
+        return;
+      }
+
+      const dmAllCooldownUntil = dmAllCooldowns.get(interaction.user.id) || 0;
+      if (dmAllCooldownUntil > Date.now()) {
+        await interaction.editReply({ content: 'Please wait before sending another server-wide message.' });
+        return;
+      }
+      dmAllCooldowns.set(interaction.user.id, Date.now() + 10 * 60 * 1000);
+
+      const message = interaction.options.getString('message', true);
+      const members = await interaction.guild.members.fetch();
+      const unreachable = [];
+
+      for (const member of members.values()) {
+        if (member.user.bot) continue;
+        try {
+          await member.user.send(message);
+        } catch (error) {
+          unreachable.push(member.user.username);
+          console.warn(`Could not send /dmall message to ${member.user.tag}:`, error.message);
+        }
+      }
+
+      if (unreachable.length === 0) {
+        await interaction.editReply({ content: 'Message sent to the whole server.' });
+      } else if (unreachable.length === 1) {
+        await interaction.editReply({ content: `Message sent to the whole server. ${unreachable[0]} couldn't be reached.` });
+      } else {
+        await interaction.editReply({ content: `Message sent to the whole server. ${unreachable.join(', ')} couldn't be reached.` });
+      }
+      await sendLog({
+        title: 'Server-Wide DM Sent',
+        description: `**${interaction.user.tag}** (<@${interaction.user.id}>) sent a message to ${members.size} server member(s).\n**Unreachable:** ${unreachable.length ? unreachable.join(', ') : 'None'}`,
+        user: interaction.user,
+      });
+      return;
+    }
+
     if (interaction.commandName === 'dm') {
       if (!isSuperAdmin(interaction.user.id) && interaction.user.id !== dmUserId) {
         await logDeniedCommand(interaction, 'User is not authorized.');
@@ -1129,18 +1212,7 @@ client.on('interactionCreate', async (interaction) => {
 
       const user = interaction.options.getUser('user', true);
       const message = interaction.options.getString('message', true);
-      const category = await interaction.guild.channels.fetch(dmCategoryId);
-
-      if (!category || category.type !== ChannelType.GuildCategory) {
-        await interaction.editReply({ content: 'The configured DM category could not be found.' });
-        return;
-      }
-
-      const dmChannel = await interaction.guild.channels.create({
-        name: dmChannelName(user.username),
-        type: ChannelType.GuildText,
-        parent: dmCategoryId,
-      });
+      const dmChannel = await createDmRelayChannel(user);
 
       try {
         await user.send(message);
@@ -1149,8 +1221,6 @@ client.on('interactionCreate', async (interaction) => {
         throw error;
       }
 
-      activeDmChannels.set(user.id, dmChannel.id);
-        dmChannelRecipients.set(dmChannel.id, user.id);
       await interaction.editReply({ content: `Message sent to ${user.tag}. Replies will appear in ${dmChannel}.` });
       return;
     }
