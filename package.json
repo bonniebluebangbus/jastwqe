@@ -1,0 +1,17 @@
+{
+  "name": "bonnie-blue-bang-bus-bot",
+  "version": "1.0.0",
+  "description": "Private Discord bot for the Bonnie Blue Bang Bus server.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "stop": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/stop-bot.ps1"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  }
+}
