@@ -406,6 +406,32 @@ function bookingApproversFor(clinicCode) {
   return clinicCode === 'gio-fannys' ? gioFannysApproverIds : bookingApproverIds;
 }
 
+async function countMessagesByUser(guild, userId) {
+  let total = 0;
+  const channels = await guild.channels.fetch();
+
+  for (const channel of channels.values()) {
+    if (!channel?.isTextBased() || typeof channel.messages?.fetch !== 'function') continue;
+
+    let before;
+    try {
+      while (true) {
+        const options = { limit: 100 };
+        if (before) options.before = before;
+        const messages = await channel.messages.fetch(options);
+        if (!messages.size) break;
+        total += messages.filter((message) => message.author?.id === userId).size;
+        if (messages.size < 100) break;
+        before = messages.last().id;
+      }
+    } catch (error) {
+      console.warn(`Could not count messages in ${channel.id}:`, error.message);
+    }
+  }
+
+  return total;
+}
+
 if (missingEnvironment.length > 0) {
   console.error(`Missing environment variables: ${missingEnvironment.join(', ')}`);
   console.error('Copy .env.example to .env and fill in the Discord application values.');
@@ -579,6 +605,15 @@ const commands = [
         .setName('user')
         .setDescription('The user whose wallet and bank you want to view.')
         .setRequired(false),
+    ),
+  new SlashCommandBuilder()
+    .setName('user')
+    .setDescription('Show a server user\'s information.')
+    .addUserOption((option) =>
+      option
+        .setName('user')
+        .setDescription('The user whose information you want to view.')
+        .setRequired(true),
     ),
   new SlashCommandBuilder()
     .setName('rob')
@@ -1368,6 +1403,40 @@ client.on('interactionCreate', async (interaction) => {
         .setTimestamp();
 
       await interaction.editReply({ embeds: [walletEmbed] });
+      return;
+    }
+
+    if (interaction.commandName === 'user') {
+      const targetUser = interaction.options.getUser('user', true);
+      const member = await interaction.guild.members.fetch(targetUser.id);
+      const account = economy.users[targetUser.id] || { wallet: 0, bank: 0 };
+      const purchasedItems = economy.purchases
+        .filter((purchase) => purchase.userId === targetUser.id)
+        .map((purchase) => purchase.itemName);
+      const roles = member.roles.cache
+        .filter((role) => role.id !== interaction.guild.id)
+        .map((role) => role.name);
+      const listValue = (items) => {
+        const value = items.length ? items.join(', ') : 'None';
+        return value.length > 1024 ? `${value.slice(0, 1021)}...` : value;
+      };
+      const totalMoney = account.wallet + account.bank;
+      const messageCount = await countMessagesByUser(interaction.guild, targetUser.id);
+      const userEmbed = new EmbedBuilder()
+        .setTitle(`${targetUser.username}'s User Info`)
+        .setThumbnail(targetUser.displayAvatarURL({ size: 128 }))
+        .addFields(
+          { name: 'Messages', value: messageCount.toLocaleString('en-US'), inline: false },
+          { name: 'Purchased Items', value: listValue(purchasedItems), inline: false },
+          { name: 'Money in wallet', value: formatMoney(account.wallet), inline: true },
+          { name: 'Money in bank', value: formatMoney(account.bank), inline: true },
+          { name: 'Money in total', value: formatMoney(totalMoney), inline: true },
+          { name: 'Roles', value: listValue(roles), inline: false },
+        )
+        .setColor(0x5865f2)
+        .setTimestamp();
+
+      await interaction.editReply({ embeds: [userEmbed] });
       return;
     }
 
