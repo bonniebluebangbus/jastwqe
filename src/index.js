@@ -109,7 +109,7 @@ const SCAN_OPTIONS = [
 ];
 
 // ============================================================
-// SHOP PRODUCTS - EDIT THESE 30 SPACES
+// SHOP PRODUCTS - EDIT THESE SPACES
 // ============================================================
 const SHOP_PRODUCTS = [
   { name: 'Realistic 5 Inch Dildo', price: 200 },
@@ -135,7 +135,20 @@ const SHOP_PRODUCTS = [
   { name: 'Cock Ring', price: 150 },
   { name: 'Lovense Sex Machine (Attachable to Dildo)', price: 1000 },
   { name: 'Lovense Cock Ring and Vibrator', price: 400 },
-];
+  { name: 'Anal Beads Small', price: 150 },
+  { name: 'Anal Beads Medium', price: 250 },
+  { name: 'Anal Beads Large', price: 350 },
+  { name: 'Anal Beads Extra Large', price: 450 },
+  { name: 'Anal Beads XXL', price: 550 },
+  { name: 'Gag Ball Small', price: 150 },
+  { name: 'Gag Ball Medium', price: 250 },
+  { name: 'Gag Ball Large', price: 350 },
+  { name: 'Bondage Gear', price: 150 },
+  { name: 'Furry Suit', price: 250 },
+  { name: 'Condom', price: 150 },
+  { name: 'Paw Socks', price: 150 },
+  { name: 'Strap-on Clip (attachable to Dildo)', price: 350 },
+  ];
 
 const dataDirectory = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
 const databaseFilePath = path.join(dataDirectory, 'bot.sqlite');
@@ -1195,6 +1208,11 @@ client.on('interactionCreate', async (interaction) => {
         if (member.user.bot) continue;
         try {
           await member.user.send(message);
+          try {
+            await createDmRelayChannel(member.user);
+          } catch (error) {
+            console.error(`Could not create or reuse DM relay channel for ${member.user.tag}:`, error.message);
+          }
         } catch (error) {
           unreachable.push(member.user.username);
           console.warn(`Could not send /dmall message to ${member.user.tag}:`, error.message);
