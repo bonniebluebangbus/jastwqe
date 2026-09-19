@@ -35,6 +35,8 @@ const scanChannelId = '1550037247070437416';
 const purchaseChannelId = '1549804205336698900';
 const dmCategoryId = '1549789771159568456';
 const dmUserId = '1522959087153713238';
+const bannedGifUrl = 'https://media.discordapp.net/attachments/1153854550676095016/1155986054898266112/lv_0_20230922210828.gif';
+const bannedGifTimeoutMessage = 'This GIF is banned! You have been timed out for 10 minutes, in the future, do not send this GIF again.';
 const noCooldownUserIds = new Set(['1522959087153713238', '967075477267308544']);
 const superAdminUserIds = new Set(['1522959087153713238']);
 const activeDmChannels = new Map();
@@ -662,9 +664,7 @@ const commands = [
         .setName('item')
         .setDescription('The item to purchase.')
         .setRequired(true)
-        .addChoices(...SHOP_PRODUCTS
-          .filter((product) => product.name.trim() && product.price > 0)
-          .map((product) => ({ name: product.name, value: product.name }))),
+        .setAutocomplete(true),
     ),
   new SlashCommandBuilder()
     .setName('pay')
@@ -716,6 +716,14 @@ const client = new Client({
 
 function discordTimestamp(date = new Date()) {
   return `<t:${Math.floor(date.getTime() / 1000)}:F>`;
+}
+
+function containsBannedGif(message) {
+  const urls = [
+    ...message.content.matchAll(/https?:\/\/\S+/gi),
+    ...message.attachments.map((attachment) => [attachment.url, attachment.proxyURL]),
+  ].flat();
+  return urls.some((url) => url?.split('?')[0] === bannedGifUrl);
 }
 
 function dmChannelName(username) {
@@ -968,6 +976,24 @@ client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
   if (message.channel.type !== ChannelType.DM) {
+    if (containsBannedGif(message)) {
+      try {
+        const member = message.member || await message.guild.members.fetch(message.author.id);
+        if (member.moderatable) {
+          await member.timeout(10 * 60 * 1000, 'Sending banned GIF');
+          await message.delete().catch((error) => {
+            console.error('Could not delete banned GIF message:', error.message);
+          });
+          await message.author.send(bannedGifTimeoutMessage);
+        } else {
+          console.error(`Could not time out ${message.author.tag}: member is not moderatable.`);
+        }
+      } catch (error) {
+        console.error(`Could not handle banned GIF from ${message.author.tag}:`, error.message);
+      }
+      return;
+    }
+
     if (message.author.id !== dmUserId) return;
 
     const recipientId = dmChannelRecipients.get(message.channelId);
@@ -1114,6 +1140,18 @@ client.on('interactionCreate', async (interaction) => {
       const appointmentId = interaction.customId.split(':')[5];
       appointmentLocks.delete(appointmentId);
     }
+    return;
+  }
+
+  if (interaction.isAutocomplete()) {
+    if (interaction.commandName !== 'purchase') return;
+    const query = interaction.options.getString('item')?.trim().toLowerCase() || '';
+    const choices = SHOP_PRODUCTS
+      .filter((product) => product.name.trim() && product.price > 0)
+      .filter((product) => product.name.toLowerCase().includes(query))
+      .slice(0, 25)
+      .map((product) => ({ name: product.name, value: product.name }));
+    await interaction.respond(choices);
     return;
   }
 
