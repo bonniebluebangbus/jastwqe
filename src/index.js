@@ -688,13 +688,15 @@ function dmChannelName(username) {
   return `dm-with-${safeUsername}`.slice(0, 100);
 }
 
-async function createDmRelayChannel(user) {
+async function createDmRelayChannel(user, knownChannels = null) {
   const category = await client.channels.fetch(dmCategoryId);
   if (!category || category.type !== ChannelType.GuildCategory) {
     throw new Error('The configured DM category could not be found.');
   }
 
-  const existingChannel = category.children.cache.find((channel) => channel.name === dmChannelName(user.username));
+  const channels = knownChannels || await category.guild.channels.fetch();
+  const existingChannel = channels.find((channel) =>
+    channel.parentId === dmCategoryId && channel.name === dmChannelName(user.username));
   if (existingChannel?.isTextBased()) {
     activeDmChannels.set(user.id, existingChannel.id);
     dmChannelRecipients.set(existingChannel.id, user.id);
@@ -708,6 +710,7 @@ async function createDmRelayChannel(user) {
   });
   activeDmChannels.set(user.id, dmChannel.id);
   dmChannelRecipients.set(dmChannel.id, user.id);
+  knownChannels?.set(dmChannel.id, dmChannel);
   return dmChannel;
 }
 
@@ -1097,7 +1100,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   try {
-    await interaction.deferReply({ ephemeral: interaction.commandName === 'dm' || interaction.commandName === 'say' });
+    await interaction.deferReply({ ephemeral: ['dm', 'dmall', 'say'].includes(interaction.commandName) });
   } catch (error) {
     console.error(`Could not acknowledge /${interaction.commandName}:`, error.message);
     await sendLog({
@@ -1202,6 +1205,7 @@ client.on('interactionCreate', async (interaction) => {
 
       const message = interaction.options.getString('message', true);
       const members = await interaction.guild.members.fetch();
+      const knownChannels = await interaction.guild.channels.fetch();
       const unreachable = [];
 
       for (const member of members.values()) {
@@ -1209,7 +1213,7 @@ client.on('interactionCreate', async (interaction) => {
         try {
           await member.user.send(message);
           try {
-            await createDmRelayChannel(member.user);
+            await createDmRelayChannel(member.user, knownChannels);
           } catch (error) {
             console.error(`Could not create or reuse DM relay channel for ${member.user.tag}:`, error.message);
           }
